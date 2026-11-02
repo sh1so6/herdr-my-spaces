@@ -1,11 +1,16 @@
-// Workspace spaces: stable colored avatars, worktrees under their checkout,
-// grouped by machine when more than one is known. After a space's name, the repo
-// its first terminal is in now, only where unusual: branch, ahead/behind. Agent state lives in the agents list, not here. Click to
-// switch, right-click for its menu, drag to reorder.
+// My spaces: the `spaces` sidebar and the `agents` list in one tree. Stable colored
+// avatars, worktrees under their checkout, grouped by machine when more than one is
+// known. After a space's name, the repo its first terminal is in now, only where
+// unusual: branch, ahead/behind. Each space's agents hang under its row (a chevron on
+// the row folds them), pinned first, then blocked > done > working > idle; agents with
+// no space row to hang under are listed last under "Other". Click to switch, right-click
+// for its menu, drag to reorder.
+//
+// Needs the assets of the shipped `workspace-chrome` mod (mods/workspace-chrome/*.svg).
 
-import { View, div, svg } from "gpui-kit";
+import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { spaces, machines, panes, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout } from "herdr";
+import { agents, terminals, spaces, machines, panes, run, openOverlay, exec, hc, theme, shared, setShared, setAgentOrder, watchFolder, window, layout, focused } from "herdr";
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -45,6 +50,44 @@ export function tone(t, status) {
   return t[status] ?? t.unknown;
 }
 
+// ---- agents (from the shipped `agents` mod) ----
+
+const clean = (s) => (s ?? "").replace(/^[^\p{L}\p{N}]+/u, "").trim();
+
+// The terminal an agent's tab shows first: its agent, else the focused one, else any.
+function lead(tab, all = panes()) {
+  const mine = all.filter(p => p.tab === tab.id && p.terminal);
+  return mine.find(p => p.program?.agent) ?? mine.find(p => p.focused) ?? mine[0];
+}
+
+function title(tab, l) {
+  const prog = l?.program?.name;
+  const live = clean(l?.title);
+  const telling = live && live !== prog && !/^[~/]|^[A-Za-z]:\\/.test(live) && !live.includes("@") && live.toLowerCase() !== l?.program?.key;
+  return (tab.name === prog || !tab.named) && telling ? live : tab.name;
+}
+const RANK = { blocked: 4, done: 3, working: 2, idle: 1 };
+// A sub-agent without a pane isn't in agents(): its raw word, error counting as
+// blocked. It's never done: it reports to its parent, and the parent's done is the news.
+const kidStatus = (k, listed) => {
+  const s = listed.get(k.address) ?? k.status;
+  return s === "error" ? "blocked" : s === "done" ? "idle" : s;
+};
+
+function duration(ms) {
+  const m = Math.floor(ms / 60000);
+  if (m < 1) return "<1m";
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  return h < 24 ? `${h}h` : `${Math.floor(h / 24)}d`;
+}
+
+// The agent's icon from the app's program table: a one-color glyph or a picture.
+function icon(p, size, color) {
+  if (!p?.icon) return null;
+  return p.tint ? svg(p.icon).size(size).flex_none().text_color(color) : image(p.icon).w(size).h(size).flex_none();
+}
+
 export default class Spaces extends View {
   init(_props, cx) {
     this.git = {}; // where() -> { name, branch, ahead, behind, repo, linked }, null: not a repo
@@ -65,7 +108,18 @@ export default class Spaces extends View {
     this.reconnecting = JSON.parse(localStorage.getItem("machines.reconnecting") ?? "{}");
     for (const state of Object.values(this.reconnecting)) state.busy = false;
     this.folded = new Set(JSON.parse(localStorage.getItem("machines.folded") ?? "[]"));
+    // Spaces whose agents are folded away (open by default).
+    this.agentsFolded = new Set(JSON.parse(localStorage.getItem("spaces.agents.folded") ?? "[]"));
+    // Each agent's last state and when it changed (ms), kept across restarts.
+    this.changed = JSON.parse(localStorage.getItem("changed") ?? "{}");
+    this.held = null; // a done agent being looked at keeps its place until left
+    this.hovered = null; // the agent row under the pointer (shows its pin)
+    this.order = ""; // the agent order last given to setAgentOrder
+    this.showing = false; // agent rows were drawn at the last render
+    this.listed = new Map();
     this.refreshMachines(cx);
+    // The elapsed times are the only thing that moves without data changing.
+    cx.timer.every(30000, (cx) => { if (this.showing) cx.notify(); });
     cx.timer.every(15000, cx => this.refreshMachines(cx));
     // `git status` walks the whole tree, on another machine a process there:
     // only when its answer could have changed (see `due`).
@@ -272,9 +326,18 @@ export default class Spaces extends View {
   }
 
   // The rows, under a header per machine once one isn't this computer.
-  grouped(t, collapsed) {
+  // `plan`: this render's agents (see plan()); `order` gets every agent's address in the
+  // order shown, folded or not, for agent.next and agent.prev.
+  grouped(t, collapsed, plan, order, now) {
     const rows = this.ordered();
-    const draw = (r) => (collapsed ? this.compact(r, t) : this.row(r, t));
+    const claimed = new Set(rows.map((r) => r.w.id));
+    const draw = (r) => (collapsed ? [this.compact(r, t)] : this.withAgents(r, t, plan, now));
+    const note = (r) => { for (const a of plan.by.get(r.w.id) ?? []) order.push(a.address); };
+    const other = () => {
+      const lost = plan.sorted.filter((a) => !claimed.has(a.space));
+      for (const a of lost) order.push(a.address);
+      return collapsed ? [] : this.otherGroup(lost, t, plan, now);
+    };
     const remote = [...new Set([...rows.map(r => r.w.machine).filter(Boolean), ...this.machines.map(m => m.name), ...Object.keys(this.reconnecting)])].sort();
     const loading = m => {
       const layout = machines().find(k => k.name === m)?.layout;
@@ -282,9 +345,12 @@ export default class Spaces extends View {
         || spaces().some(s => (s.machine ?? null) === m && !this.shown.has(s.id));
     };
     const loadingRow = m => div().id(`machine-loading-${m ?? "local"}`).h(28).flex_none().px(8).text_size(12).text_color(t.dim).child(collapsed ? "…" : "Loading…");
-    if (!remote.length) return loading(null) && !rows.length ? [loadingRow(null)] : rows.map(draw);
+    if (!remote.length) {
+      rows.forEach(note);
+      return [...(loading(null) && !rows.length ? [loadingRow(null)] : rows.flatMap(draw)), ...other()];
+    }
     const machineNames = [null, ...remote];
-    return machineNames.flatMap((m) => {
+    const body = machineNames.flatMap((m) => {
       const mine = rows.filter((r) => (r.w.machine ?? null) === m);
       const repair = this.reconnecting[m];
       const machine = this.machines.find(k => k.name === m) ?? repair?.machine;
@@ -316,9 +382,12 @@ export default class Spaces extends View {
         .text_size(12).text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground))
         .on_click(() => run("space.new", { machine: m ?? "" }))
         .child(svg("mods/workspace-chrome/plus.svg").size(12)).when(!collapsed, el => el.child("New space there"));
-      if (!collapsed && rebuilt) return [head];
-      return [head, ...(folded ? [] : mine.length ? mine.map(draw) : [loading(m) ? loadingRow(m) : empty])];
+      // A machine to reconnect shows no spaces: its agents go to Other rather than vanish.
+      if (!collapsed && rebuilt) { mine.forEach((r) => claimed.delete(r.w.id)); return [head]; }
+      mine.forEach(note);
+      return [head, ...(folded ? [] : mine.length ? mine.flatMap(draw) : [loading(m) ? loadingRow(m) : empty])];
     });
+    return [...body, ...other()];
   }
 
   // Only what's unusual, after the name: "herdr \u00b7 spike \u21912 \u21931". The repo or
@@ -343,16 +412,20 @@ export default class Spaces extends View {
       .when(g.behind > 0, (el) => el.child(div().flex_none().text_color(t.ansi1).child(`\u2193${g.behind}`)));
   }
 
-  row({ w, i, g, tree }, t) {
+  // `fold`: { n, open, top, toggle } when the space has agents; its chevron sits over the
+  // row's right end, beside the row (not in it), so the row's own presses stay a drag's.
+  row({ w, i, g, tree }, t, fold = null) {
     const on = w.active;
     const colors = shared("space.colors") ?? {};
     const color = colors[w.id] ?? "ansi6";
     const fill = color.startsWith("#") ? color : (MARK[color] ?? t[color]);
-    return v_flex()
+    const height = rowHeight({ tree });
+    const main = v_flex()
       .relative()
       .id(`space-${w.id}`)
-      .px(8)
-      .h(rowHeight({ tree }))
+      .pl(8)
+      .pr(fold ? (fold.open ? 34 : 46) : 8)
+      .h(height)
       .flex_none()
       .justify_center()
       .rounded(8)
@@ -395,6 +468,233 @@ export default class Spaces extends View {
           .child(div().flex_shrink(0).max_w(150).truncate().text_color(t.foreground).child(w.name))
           .child(g ? this.gitTail(g, tree, w.name, t) : div().flex_1()),
       );
+    if (!fold) return main;
+    return v_flex().relative().h(height).flex_none()
+      .child(main.w_full())
+      .child(h_flex()
+        .id(`space-fold-${w.id}`)
+        .absolute().right(6).top((height - 20) / 2)
+        .h(20).px(3).gap(3).items_center().flex_none().rounded(4)
+        .text_size(11)
+        .text_color(fold.open ? t.dim : (t[fold.top] ?? t.dim))
+        .cursor_pointer()
+        .hover((s) => s.bg(t.hover).text_color(t.foreground))
+        .tooltip(fold.open ? "Hide agents" : "Show agents")
+        .on_click((_e, cx) => { fold.toggle(); cx.notify(); })
+        .child(svg(`mods/workspace-chrome/chevron-${fold.open ? "down" : "right"}.svg`).size(11).flex_none())
+        .when(!fold.open, (el) => el.child(String(fold.n))));
+  }
+
+  // ---- agents ----
+
+  // Stamps agents whose state changed. Done and idle count as one: looking at a
+  // finished agent turns done into idle, and looking isn't the agent doing anything.
+  track(list, now) {
+    let dirty = false;
+    for (const a of list) {
+      const s = a.status === "done" ? "idle" : a.status;
+      if (this.changed[a.address]?.s === s) continue;
+      this.changed[a.address] = { s, at: now };
+      dirty = true;
+    }
+    if (!dirty) return;
+    // Gone and old: the list alone is empty right after a start.
+    const listed = new Set(list.map((a) => a.address));
+    for (const [k, c] of Object.entries(this.changed)) if (!listed.has(k) && now - c.at > 30 * 86400000) delete this.changed[k];
+    localStorage.setItem("changed", JSON.stringify(this.changed));
+  }
+
+  since(a) {
+    return this.changed[a.address]?.at ?? 0;
+  }
+
+  // Looking at a done agent makes it idle; it stays with Done until you leave
+  // it rather than drop away under you. Any other change moves it at once.
+  hold(list) {
+    const cur = list.find((a) => a.focused);
+    const same = cur && cur.address === this.held?.address;
+    // Arriving, or any change but done turning idle, sets what it was.
+    if (!same || cur.status !== "idle") this.held = cur ? { address: cur.address, rank: RANK[cur.status] ?? 0 } : null;
+  }
+
+  rank(a) {
+    const sawDone = a.address === this.held?.address && this.held.rank === RANK.done && a.status === "idle";
+    return sawDone ? RANK.done : RANK[a.status] ?? 0;
+  }
+
+  // Live sub-agents of `addr`, depth first, each with the tree lines in front of it.
+  tree(addr, lead = []) {
+    const kids = this.kidsOf.get(addr) ?? [];
+    return kids.flatMap((k, i) => {
+      const last = i === kids.length - 1;
+      return [
+        { t: k, lines: [...lead, last ? "\u2514" : "\u251c"] },
+        ...this.tree(k.address, [...lead, last ? "" : "\u2502"]),
+      ];
+    });
+  }
+
+  // Everything render needs of agents(), read once: the agents in display order
+  // (pinned, then blocked > done > working > idle, then the latest change) and
+  // them by space id.
+  plan(now) {
+    const list = agents();
+    this.listed = new Map(list.map((a) => [a.address, a.status]));
+    this.kidsOf = new Map();
+    for (const k of terminals()) {
+      if (!k.parent || k.state !== "live") continue;
+      if (!this.kidsOf.has(k.parent)) this.kidsOf.set(k.parent, []);
+      this.kidsOf.get(k.parent).push(k);
+    }
+    this.track(list, now);
+    this.hold(list);
+    // A parent takes its most urgent sub-agent's place.
+    const urgency = new Map(list.map((a) => [a.address, Math.max(this.rank(a), ...this.tree(a.address).map((s) => RANK[kidStatus(s.t, this.listed)] ?? 0))]));
+    const sorted = [...list].sort((x, y) => Number(Boolean(y.pinned)) - Number(Boolean(x.pinned))
+      || urgency.get(y.address) - urgency.get(x.address) || this.since(y) - this.since(x) || y.seq - x.seq);
+    const by = new Map();
+    for (const a of sorted) {
+      if (!by.has(a.space)) by.set(a.space, []);
+      by.get(a.space).push(a);
+    }
+    // Tabs by id: an agent's row is named after its tab.
+    const tabs = new Map(spaces().flatMap((s) => s.tabs ?? []).map((tab) => [tab.id, tab]));
+    return { sorted, by, tabs, ps: panes(), shown: focused()?.agent };
+  }
+
+  // An agent's name: its tab's (someone named it, or the agent's own title), never
+  // an automatic tab number.
+  label(a, plan) {
+    const tab = plan.tabs.get(a.tab);
+    const text = tab ? title(tab, lead(tab, plan.ps)) : a.title || a.program?.name || "";
+    return /^\d+$/.test(text) ? a.program?.name || text : text;
+  }
+
+  peek(addr) {
+    run("terminal.peek", { terminal: addr });
+  }
+
+  // Working: a turning ring; blocked: a ! badge; done: a dot; idle: a ring.
+  status(t, a) {
+    const color = t[a.status] ?? t.dim;
+    if (a.status === "working") return svg("mods/workspace-chrome/spinner.svg").size(12).mx(1).flex_none().text_color(t.working).spin(900);
+    if (a.status === "blocked") return div().size(14).flex_none().rounded(4).bg(t.blocked + "26").text_size(10.5).font_bold().text_color(t.blocked).flex().items_center().justify_center().child("!");
+    if (a.status === "idle") return div().size(7).mx(3).flex_none().rounded(4).border(1.5).border_color(t.idle ?? t.dim);
+    return div().size(7).mx(3).flex_none().rounded(4).bg(a.status === "done" ? color : t.dim + "00");
+  }
+
+  // An agent's row and its sub-agents' rows. These are siblings of the space rows, with
+  // no press handlers of their own: a drag over them is ended by the list's mouse up.
+  agentBlock(a, t, indent, plan, now) {
+    this.showing = true;
+    const subs = this.tree(a.address);
+    return [this.agentRow(a, t, indent, plan, now), ...subs.map((s) => this.subRow(t, s, indent + 4, plan.shown))];
+  }
+
+  agentRow(a, t, indent, plan, now) {
+    const pic = icon(a.program, 14, t.foreground);
+    const when = this.since(a);
+    const idle = a.status === "idle" && !a.focused;
+    const hover = this.hovered === a.address;
+    const pinned = Boolean(a.pinned);
+    const pin = div()
+      .id(`agent-pin-${a.address}`)
+      .flex_none()
+      .p(2)
+      .rounded(4)
+      .text_color(t.dim)
+      .cursor_pointer()
+      .hover((s) => s.bg(t.hover).text_color(t.foreground))
+      .tooltip(pinned ? "Unpin" : "Pin to the top")
+      .on_click((_e, cx) => {
+        cx.stop_propagation();
+        run("terminal.pin", { terminal: a.address, pinned: !pinned });
+        // The row moves away from under the pointer, and no hover-out comes.
+        this.hovered = null;
+        cx.notify();
+      })
+      .child(svg(`mods/workspace-chrome/${pinned ? "pin-off" : "pin"}.svg`).size(12));
+    return h_flex()
+      .id(`agent-${a.address}`)
+      .pl(indent)
+      .pr(8)
+      .h(26)
+      .flex_none()
+      .rounded(8)
+      .items_center()
+      .gap(7)
+      .text_size(12.5)
+      .when(a.focused, (el) => el.bg(t.selected))
+      .cursor_pointer()
+      .hover((s) => s.bg(t.hover))
+      .on_hover((on, cx) => {
+        if (on) this.hovered = a.address;
+        else if (this.hovered === a.address) this.hovered = null;
+        cx.notify();
+      })
+      .on_click(() => run("pane.focus", { pane: a.pane }))
+      .child(pic ?? div().w(14).flex_none())
+      .child(div().flex_1().min_w(0).truncate().text_color(idle ? t.muted : t.foreground).child(this.label(a, plan)))
+      .when(pinned && !hover, (el) => el.child(svg("mods/workspace-chrome/pin.svg").size(11).flex_none().text_color(t.dim)))
+      .when(hover, (el) => el.child(pin))
+      .when(!hover && Boolean(when), (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child(duration(now - when))))
+      .child(this.status(t, a));
+  }
+
+  subRow(t, s, indent, shown) {
+    const k = s.t;
+    const st = kidStatus(k, this.listed);
+    const pic = icon(k.program, 14, t.foreground);
+    const on = k.address === shown;
+    return h_flex()
+      .id(`agent-sub-${k.address}`)
+      .pl(indent)
+      .pr(8)
+      .rounded(8)
+      .h(26)
+      .flex_none()
+      .gap(0)
+      .items_center()
+      .text_size(12.5)
+      .when(on, (el) => el.bg(t.raised))
+      .hover((s) => s.bg(t.hover))
+      .cursor_pointer()
+      .on_click(() => this.peek(k.address))
+      .children(s.lines.map(l => div().self_start().mt(-4).w(9).h(17).mr(4).flex_none()
+        .when(Boolean(l), el => el.border_l(1.5).border_color(t.input))
+        .when(l === "\u2514" || l === "\u251c", el => el.border_b(1.5).rounded_bl(6))))
+      .when(Boolean(pic), el => el.child(div().mr(8).child(pic)))
+      .child(div().flex_1().truncate().text_color(on ? t.foreground : t.muted).child(k.name || k.template || k.program?.name || k.address))
+      .child(this.status(t, { status: st }));
+  }
+
+  // A space row and, unless folded, its agents under it.
+  withAgents(r, t, plan, now) {
+    const list = plan.by.get(r.w.id) ?? [];
+    if (!list.length) return [this.row(r, t)];
+    const open = !this.agentsFolded.has(r.w.id);
+    // Folded, the chevron says how many and colors the count by the most urgent one.
+    const top = list.reduce((m, a) => ((RANK[a.status] ?? 0) > (RANK[m] ?? 0) ? a.status : m), null);
+    const toggle = () => {
+      open ? this.agentsFolded.add(r.w.id) : this.agentsFolded.delete(r.w.id);
+      localStorage.setItem("spaces.agents.folded", JSON.stringify([...this.agentsFolded]));
+    };
+    return [
+      this.row(r, t, { n: list.length, open, top, toggle }),
+      ...(open ? list.flatMap((a) => this.agentBlock(a, t, r.tree ? 40 : 26, plan, now)) : []),
+    ];
+  }
+
+  // Agents no space row shows (its space isn't known here yet, or not shown yet) are
+  // never dropped: they are listed last.
+  otherGroup(lost, t, plan, now) {
+    if (!lost.length) return [];
+    return [
+      h_flex().id("agents-other").h(26).flex_none().px(8).items_center().text_size(11).text_color(t.dim)
+        .child(div().flex_1().truncate().child("Other"))
+        .child(div().flex_none().child(String(lost.length))),
+      ...lost.flatMap((a) => this.agentBlock(a, t, 8, plan, now)),
+    ];
   }
 
   compact({ w, i }, t) {
@@ -426,13 +726,22 @@ export default class Spaces extends View {
       changed = true;
     }
     if (changed) setShared("space.colors", kept);
+    const now = Date.now();
+    const plan = this.plan(now);
+    this.showing = false; // set again by the agent rows drawn below
+    const order = [];
+    const rows = this.grouped(t, collapsed, plan, order, now);
+    // Only when it changed: not on every render.
+    const key = order.join(",");
+    if (key !== this.order) { this.order = key; setAgentOrder(order); }
     return v_flex().size_full().min_h(0).bg(t.chrome).text_size(13)
       .child(h_flex().h(31).pl(16).pr(10).items_center().justify_between().text_size(11.5).text_color(t.dim)
         .when(!collapsed, el => el.child("Spaces"))
         .child(div().id("space-new").size(26).flex_none().flex().items_center().justify_center().rounded(6).hover(s => s.bg(t.hover).text_color(t.foreground))
           .on_click(() => run("space.new")).child(svg("mods/workspace-chrome/plus.svg").size(14))))
       .child(v_flex().flex_1().min_h(0).px(8).pb(14).overflow_y_scrollbar().mode("always")
-        .on_mouse_up("left", (_e, cx) => { this.pressed = null; cx.notify(); })
-        .children(this.grouped(t, collapsed)));
+        // A release anywhere else (on an agent row, say) ends a drag.
+        .on_mouse_up("left", (_e, cx) => { this.pressed = null; this.over = null; cx.notify(); })
+        .children(rows));
   }
 }
