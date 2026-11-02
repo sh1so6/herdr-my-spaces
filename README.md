@@ -16,23 +16,43 @@ hanging under it.
   Spaces without agents show no chevron.
 - Agents with no space row to hang under (space not shown yet, machine being reconnected)
   are listed last under **Other**, never dropped.
-- `setAgentOrder` gets every agent (folded ones too) in display order, only when it changes,
+- `setAgentOrder` gets every agent (inactive ones last) (folded ones too) in display order, only when it changes,
   so `agent.next` / `agent.prev` follow the list.
+- **Pin a space**: a pin button appears when you hover a space row (a small pin stays on pinned ones). Pinned
+  spaces come first in their machine's group; the rest keep the core's order, and a worktree stays under its checkout.
+  Drag-reordering only works between rows of the same machine *and* the same pin state; the core order
+  (`space.move`) is never changed by pinning.
+- **Inactive group**: spaces you aren't using can be moved to an **Inactive (n)** group at the end of the list
+  (after the machine groups and **Other**), folded by default. It lists every machine's inactive spaces flat, in
+  core order, with the machine named, and their agents as usual. Its heading shows a dot when an inactive space has a
+  blocked or done agent; nothing is activated automatically. Move a space either with the second hover button
+  ("Move to Inactive" / "Move back") or by dragging its row onto the Inactive heading (or onto any row in it);
+  drag an inactive row onto a machine heading or an active row to bring it back. The heading shows while dragging even
+  when empty. Worktree nesting is computed from the active spaces only, so an active worktree of an inactive
+  checkout is a plain row. The selected space can be made inactive and stays highlighted.
 - The collapsed rail (sidebar narrower than 160 px) is the shipped compact list, no agents.
+
+## Saved state
+
+Per mod copy, in `localStorage` (the core has no pin/hide commands): `spaces.pinned` and `spaces.inactive` (arrays of
+space ids), `spaces.inactive.folded` (boolean, default `true`), `spaces.agents.folded`, `machines.folded`.
+Ids of spaces that no longer exist are not pruned (a machine that is away must not lose its pins), so old ids
+stay in the arrays; they are harmless.
 
 ## Dependencies
 
 It draws icons from the shipped **`workspace-chrome`** mod's assets and does not ship its own:
-`mods/workspace-chrome/{spinner,chevron-down,chevron-right,pin,pin-off,plus,server,monitor,branch}.svg`.
+`mods/workspace-chrome/{spinner,chevron-down,chevron-right,pin,pin-off,archive,plus,server,monitor,branch}.svg`.
+Its own `mods/my-spaces/archive-restore.svg` (the "Move back" button) ships in the repo.
 Agent program icons come from the app's program table (`icons/…`).
 The layout also uses the shipped `workspace-chrome`, `tabs`, `pane`, `files`, `changes`, `workspace-status`
 mods (as `main` does).
 
 ## Files
 
-- `mods/my-spaces/{main.js,mod.json}` — the mod. A clone of `spaces` (0.1.12) with the agent tree added.
+- `mods/my-spaces/{main.js,mod.json,archive-restore.svg}` — the mod. A clone of `spaces` (0.1.12) with the agent tree added.
 - `layouts/my-layout.json` — a clone of `main` whose sidebar is just `my-spaces` at full height.
-- `install.ps1` — copies both into `~/.config/herdr-app` (or `$HERDR_APP_HOME`) and runs `herdr-app check`.
+- `install.ps1` — copies the mod (`main.js`, `mod.json`, `*.svg`) and the layout into `~/.config/herdr-app` (or `$HERDR_APP_HOME`) and runs `herdr-app check`.
 
 ## Install
 

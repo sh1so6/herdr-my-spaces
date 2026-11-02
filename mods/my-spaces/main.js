@@ -3,8 +3,10 @@
 // known. After a space's name, the repo its first terminal is in now, only where
 // unusual: branch, ahead/behind. Each space's agents hang under its row (a chevron on
 // the row folds them), pinned first, then blocked > done > working > idle; agents with
-// no space row to hang under are listed last under "Other". Click to switch, right-click
-// for its menu, drag to reorder.
+// no space row to hang under are listed under "Other". Click to switch, right-click
+// for its menu, drag to reorder. A space can be pinned (first in its machine's group) or
+// moved to the "Inactive" group at the end of the list; both are kept here (localStorage:
+// spaces.pinned, spaces.inactive, spaces.inactive.folded), the core's order is untouched.
 //
 // Needs the assets of the shipped `workspace-chrome` mod (mods/workspace-chrome/*.svg).
 
@@ -102,8 +104,18 @@ export default class Spaces extends View {
     // worktree appears under its repo instead of jumping there.
     this.shown = new Set(spaces().map((s) => s.id));
     this.born = {};
+    // A drag: the pressed space's index in spaces(), the row it is over (an index), and
+    // what it is: { id, machine, pinned, inactive } (see endDrag).
     this.pressed = null;
     this.over = null;
+    this.src = null;
+    this.moved = false; // the pointer moved since the press
+    this.overInactive = false; // over the Inactive heading or one of its rows
+    this.overMachine = null; // over a machine heading (key), when dragging an inactive space back
+    this.hoverSpace = null; // the space row under the pointer (shows its buttons)
+    this.pins = new Set(JSON.parse(localStorage.getItem("spaces.pinned") ?? "[]"));
+    this.inactive = new Set(JSON.parse(localStorage.getItem("spaces.inactive") ?? "[]"));
+    this.inactiveFolded = JSON.parse(localStorage.getItem("spaces.inactive.folded") ?? "true");
     this.machines = [];
     this.reconnecting = JSON.parse(localStorage.getItem("machines.reconnecting") ?? "{}");
     for (const state of Object.values(this.reconnecting)) state.busy = false;
@@ -304,33 +316,60 @@ export default class Spaces extends View {
     openOverlay({ mod: "menu", kind: "popup", width: 200, height: 260, props: { tab: "space", target: { id: w.id } } });
   }
 
-  // Spaces in order, each worktree space moved under its main checkout's.
+  endDrag() {
+    this.pressed = null;
+    this.over = null;
+    this.src = null;
+    this.moved = false;
+    this.overInactive = false;
+    this.overMachine = null;
+  }
+
+  save(key, set) {
+    localStorage.setItem(key, JSON.stringify([...set]));
+  }
+
+  togglePin(id) {
+    this.pins.has(id) ? this.pins.delete(id) : this.pins.add(id);
+    this.save("spaces.pinned", this.pins);
+  }
+
+  setInactive(id, on) {
+    on ? this.inactive.add(id) : this.inactive.delete(id);
+    this.save("spaces.inactive", this.inactive);
+  }
+
+  // Spaces in order, each worktree space moved under its main checkout's: { out, inactive }.
+  // The nesting is of the active spaces only; pinned ones lead (the rest keep the core's
+  // order), a worktree stays under its checkout. `inactive`: the others, flat, core order.
   ordered() {
     const sp = spaces(), ps = panes();
     const ready = (w) => this.shown.has(w.id) || where(w, ps) in this.git || Date.now() - (this.born[w.id] ??= Date.now()) > 1500;
     for (const w of sp) if (!this.shown.has(w.id) && ready(w)) this.shown.add(w.id);
-    const list = sp.map((w, i) => ({ w, i, g: this.git[where(w, ps)] ?? null })).filter((r) => this.shown.has(r.w.id));
+    const all = sp.map((w, i) => ({ w, i, g: this.git[where(w, ps)] ?? null })).filter((r) => this.shown.has(r.w.id));
+    const inactive = all.filter((r) => this.inactive.has(r.w.id)).map((r) => ({ ...r, tree: null }));
+    const list = all.filter((r) => !this.inactive.has(r.w.id));
     const mains = new Set(list.filter((r) => r.g && !r.g.linked).map((r) => r.g.repo));
     const nested = (r) => r.g?.linked && mains.has(r.g.repo);
     const out = [];
     const placed = new Set(); // repos whose worktrees are listed (under the first of its spaces)
-    for (const r of list) {
-      if (nested(r)) continue;
+    const tops = list.filter((r) => !nested(r));
+    for (const r of [...tops.filter((r) => this.pins.has(r.w.id)), ...tops.filter((r) => !this.pins.has(r.w.id))]) {
       out.push({ ...r, tree: null });
       if (!r.g || r.g.linked || placed.has(r.g.repo)) continue;
       placed.add(r.g.repo);
       const kids = list.filter((k) => nested(k) && k.g.repo === r.g.repo);
       kids.forEach((k, n) => out.push({ ...k, tree: n === kids.length - 1 ? "└─" : "├─" }));
     }
-    return out;
+    return { out, inactive };
   }
 
   // The rows, under a header per machine once one isn't this computer.
   // `plan`: this render's agents (see plan()); `order` gets every agent's address in the
   // order shown, folded or not, for agent.next and agent.prev.
   grouped(t, collapsed, plan, order, now) {
-    const rows = this.ordered();
-    const claimed = new Set(rows.map((r) => r.w.id));
+    const { out: rows, inactive } = this.ordered();
+    const claimed = new Set([...rows, ...inactive].map((r) => r.w.id));
     const draw = (r) => (collapsed ? [this.compact(r, t)] : this.withAgents(r, t, plan, now));
     const note = (r) => { for (const a of plan.by.get(r.w.id) ?? []) order.push(a.address); };
     const other = () => {
@@ -338,7 +377,47 @@ export default class Spaces extends View {
       for (const a of lost) order.push(a.address);
       return collapsed ? [] : this.otherGroup(lost, t, plan, now);
     };
-    const remote = [...new Set([...rows.map(r => r.w.machine).filter(Boolean), ...this.machines.map(m => m.name), ...Object.keys(this.reconnecting)])].sort();
+    // The Inactive group, last: a heading that folds it (and takes a dragged space), then
+    // the inactive spaces of every machine, flat. Its agents come last in the order too.
+    const inactiveGroup = () => {
+      inactive.forEach(note);
+      if (collapsed || (!inactive.length && this.pressed === null)) return [];
+      const open = !this.inactiveFolded;
+      const urgent = inactive.map((r) => r.w.status).filter((st) => st === "blocked" || st === "done");
+      const top = urgent.includes("blocked") ? "blocked" : urgent[0] ?? null;
+      const over = this.overInactive;
+      const head = h_flex().id("inactive-head").h(28).flex_none().px(8).gap(7).items_center().rounded(7)
+        .text_size(11).text_color(t.dim).cursor_pointer()
+        .when(!over, (el) => el.hover((s) => s.bg(t.hover)))
+        .when(over, (el) => el.bg(t.accent + "33"))
+        .on_click((_e, cx) => {
+          this.inactiveFolded = !this.inactiveFolded;
+          localStorage.setItem("spaces.inactive.folded", JSON.stringify(this.inactiveFolded));
+          cx.notify();
+        })
+        .on_mouse_move((_e, cx) => {
+          if (this.pressed === null || !this.src || this.src.inactive) return;
+          if (this.moved && this.overInactive && this.over === null && this.overMachine === null) return;
+          this.moved = true;
+          this.overInactive = true;
+          this.over = null;
+          this.overMachine = null;
+          cx.notify();
+        })
+        .on_mouse_up("left", (_e, cx) => {
+          const s = this.src;
+          if (this.pressed === null || !s || s.inactive) return;
+          this.endDrag();
+          this.setInactive(s.id, true);
+          cx.notify();
+        })
+        .child(svg("mods/workspace-chrome/archive.svg").size(13).flex_none())
+        .child(div().flex_1().truncate().child(`Inactive (${inactive.length})`))
+        .when(Boolean(top), (el) => el.child(div().flex_none().text_color(tone(t, top)).child(glyph(top))))
+        .child(svg(`mods/workspace-chrome/chevron-${open ? "down" : "right"}.svg`).size(11).flex_none());
+      return [head, ...(open ? inactive.flatMap((r) => this.withAgents(r, t, plan, now, true)) : [])];
+    };
+    const remote = [...new Set([...[...rows, ...inactive].map(r => r.w.machine).filter(Boolean), ...this.machines.map(m => m.name), ...Object.keys(this.reconnecting)])].sort();
     const loading = m => {
       const layout = machines().find(k => k.name === m)?.layout;
       return layout === "loading" || (!layout && this.machines.some(k => k.name === m && k.state === "connected"))
@@ -347,7 +426,7 @@ export default class Spaces extends View {
     const loadingRow = m => div().id(`machine-loading-${m ?? "local"}`).h(28).flex_none().px(8).text_size(12).text_color(t.dim).child(collapsed ? "…" : "Loading…");
     if (!remote.length) {
       rows.forEach(note);
-      return [...(loading(null) && !rows.length ? [loadingRow(null)] : rows.flatMap(draw)), ...other()];
+      return [...(loading(null) && !rows.length ? [loadingRow(null)] : rows.flatMap(draw)), ...other(), ...inactiveGroup()];
     }
     const machineNames = [null, ...remote];
     const body = machineNames.flatMap((m) => {
@@ -357,8 +436,28 @@ export default class Spaces extends View {
       const connected = !m || machine?.state === "connected";
       const rebuilt = this.rebuilt(machine) || !!repair;
       const folded = this.folded.has(m);
+      const key = `machine:${m ?? "local"}`;
+      const dropHere = this.overMachine === key;
       const head = h_flex().id(`machine-${m ?? "local"}`).h(26).flex_none().px(collapsed ? 2 : 8).gap(7).items_center().text_size(11).text_color(t.dim)
-        .cursor_pointer().hover(s => s.bg(t.hover))
+        .cursor_pointer()
+        .when(!dropHere, el => el.hover(s => s.bg(t.hover)))
+        .when(dropHere, el => el.bg(t.accent + "33"))
+        // An inactive space dropped here is active again (on whatever machine it lives).
+        .on_mouse_move((_e, cx) => {
+          if (this.pressed === null || !this.src?.inactive || this.overMachine === key) return;
+          this.moved = true;
+          this.overMachine = key;
+          this.over = null;
+          this.overInactive = false;
+          cx.notify();
+        })
+        .on_mouse_up("left", (_e, cx) => {
+          const s = this.src;
+          if (this.pressed === null || !s?.inactive) return;
+          this.endDrag();
+          this.setInactive(s.id, false);
+          cx.notify();
+        })
         .on_click((_e, cx) => {
           folded ? this.folded.delete(m) : this.folded.add(m);
           localStorage.setItem("machines.folded", JSON.stringify([...this.folded]));
@@ -387,7 +486,7 @@ export default class Spaces extends View {
       mine.forEach(note);
       return [head, ...(folded ? [] : mine.length ? mine.flatMap(draw) : [loading(m) ? loadingRow(m) : empty])];
     });
-    return [...body, ...other()];
+    return [...body, ...other(), ...inactiveGroup()];
   }
 
   // Only what's unusual, after the name: "herdr \u00b7 spike \u21912 \u21931". The repo or
@@ -412,27 +511,36 @@ export default class Spaces extends View {
       .when(g.behind > 0, (el) => el.child(div().flex_none().text_color(t.ansi1).child(`\u2193${g.behind}`)));
   }
 
-  // `fold`: { n, open, top, toggle } when the space has agents; its chevron sits over the
-  // row's right end, beside the row (not in it), so the row's own presses stay a drag's.
-  row({ w, i, g, tree }, t, fold = null) {
+  // `fold`: { n, open, top, toggle } when the space has agents; `flat`: in the Inactive group
+  // (its machine named). The chevron and the pin / inactive buttons sit over the row's
+  // right end, beside the row (not in it), so the row's own presses stay a drag's.
+  row({ w, i, g, tree }, t, fold = null, flat = false) {
     const on = w.active;
     const colors = shared("space.colors") ?? {};
     const color = colors[w.id] ?? "ansi6";
     const fill = color.startsWith("#") ? color : (MARK[color] ?? t[color]);
     const height = rowHeight({ tree });
+    const inact = this.inactive.has(w.id);
+    const pinned = this.pins.has(w.id);
+    const hovered = this.hoverSpace === w.id && this.pressed === null;
+    // An inactive space dragged over this active row comes back here.
+    const dropOn = this.pressed !== null && Boolean(this.src?.inactive) && !inact && this.over === i && this.pressed !== i;
+    const clusterW = hovered ? 42 : pinned ? 20 : 0;
+    const edge = fold ? (fold.open ? 28 : 40) : 6; // the buttons' right offset, left of the chevron
     const main = v_flex()
       .relative()
       .id(`space-${w.id}`)
       .pl(8)
-      .pr(fold ? (fold.open ? 34 : 46) : 8)
+      .pr(clusterW ? edge + clusterW + 4 : fold ? (fold.open ? 34 : 46) : 8)
       .h(height)
       .flex_none()
       .justify_center()
       .rounded(8)
       .when(on, (el) => el.bg(t.selected))
-      .when(!on, (el) => el.hover((s) => s.bg(t.hover)))
+      .when(!on && !dropOn, (el) => el.hover((s) => s.bg(t.hover)))
+      .when(dropOn, (el) => el.bg(t.accent + "33"))
       .when(this.pressed === i && this.over !== i, (el) => el.opacity(0.5))
-      .when(this.pressed !== null && this.over === i && this.pressed !== i, (el) => el.child(
+      .when(this.pressed !== null && this.over === i && this.pressed !== i && !this.src?.inactive, (el) => el.child(
         div().absolute().left(0).right(0).h(2).bg(t.accent)
           .when(this.pressed < i, line => line.bottom(0))
           .when(this.pressed > i, line => line.top(0)),
@@ -440,22 +548,39 @@ export default class Spaces extends View {
       .on_mouse_down("left", () => {
         this.pressed = i;
         this.over = i;
+        this.overInactive = false;
+        this.overMachine = null;
+        this.moved = false;
+        this.src = { id: w.id, machine: w.machine ?? null, pinned, inactive: inact };
       })
       .on_mouse_move((_e, cx) => {
-        const source = spaces()[this.pressed];
-        const over = source && (source.machine ?? null) === (w.machine ?? null) ? i : null;
-        if (this.pressed !== null && this.over !== over) {
-          this.over = over;
-          cx.notify();
-        }
+        const s = this.src;
+        if (this.pressed === null || !s) return;
+        // Where a drop here would land: reorder (an active space over an active one of
+        // the same machine and pin state), inactivate (over the Inactive group), activate
+        // (an inactive space over an active row).
+        let over = null, overInactive = false;
+        if (!inact) over = s.inactive || (s.machine === (w.machine ?? null) && s.pinned === pinned) ? i : null;
+        else if (!s.inactive) overInactive = true;
+        else if (this.pressed === i) over = i;
+        if (this.moved && this.over === over && this.overInactive === overInactive && this.overMachine === null) return;
+        this.moved = true;
+        this.over = over;
+        this.overInactive = overInactive;
+        this.overMachine = null;
+        cx.notify();
       })
       .on_mouse_up("left", (_e, cx) => {
         const from = this.pressed;
         const over = this.over;
-        this.pressed = null;
-        this.over = null;
-        if (from !== null && over === i && from !== i) run("space.move", { id: spaces()[from].id, index: i + 1 });
-        else if (from === i) run("space.select", { id: w.id });
+        const s = this.src;
+        this.endDrag();
+        if (from === i) run("space.select", { id: w.id });
+        else if (from !== null && s) {
+          if (!s.inactive && !inact) { if (over === i) run("space.move", { id: s.id, index: i + 1 }); }
+          else if (!s.inactive) this.setInactive(s.id, true);
+          else if (!inact) this.setInactive(s.id, false);
+        }
         cx.notify();
       })
       .on_mouse_down("right", () => this.menu(w))
@@ -465,13 +590,36 @@ export default class Spaces extends View {
           .items_center()
           .when(Boolean(tree), el => el.pl(22).child(svg("mods/workspace-chrome/branch.svg").size(13).text_color(t.dim)))
           .when(!tree, el => el.child(h_flex().size(18).flex_none().rounded(5).bg(fill).items_center().justify_center().text_size(10.5).font_bold().text_color("#ffffff").child([...w.name][0]?.toUpperCase() ?? "?")))
-          .child(div().flex_shrink(0).max_w(150).truncate().text_color(t.foreground).child(w.name))
-          .child(g ? this.gitTail(g, tree, w.name, t) : div().flex_1()),
+          .child(div().flex_shrink(clusterW ? 1 : 0).min_w(0).max_w(150).truncate().text_color(t.foreground).child(w.name))
+          .when(flat && Boolean(w.machine), el => el.child(div().flex_none().max_w(60).truncate().text_size(10).text_color(t.dim).child(w.machine)))
+          .child(g && !hovered ? this.gitTail(g, tree, w.name, t) : div().flex_1()),
       );
-    if (!fold) return main;
-    return v_flex().relative().h(height).flex_none()
+    const btn = (id, path, tip, fn) => div().id(id).flex_none().p(4).rounded(4).text_color(t.dim).cursor_pointer()
+      .hover((s) => s.bg(t.hover).text_color(t.foreground))
+      .tooltip(tip)
+      .on_click((_e, cx) => {
+        cx.stop_propagation();
+        fn();
+        // The row may move away from under the pointer, and no hover-out comes.
+        this.hoverSpace = null;
+        cx.notify();
+      })
+      .child(svg(path).size(12));
+    const pinBtn = (path) => btn(`space-pin-${w.id}`, path, pinned ? "Unpin" : "Pin to the top", () => this.togglePin(w.id));
+    return v_flex().id(`space-wrap-${w.id}`).relative().h(height).flex_none()
+      .on_hover((over, cx) => {
+        if (over) this.hoverSpace = w.id;
+        else if (this.hoverSpace === w.id) this.hoverSpace = null;
+        cx.notify();
+      })
       .child(main.w_full())
-      .child(h_flex()
+      .when(clusterW > 0, (el) => el.child(h_flex().absolute().right(edge).top((height - 20) / 2).h(20).gap(2).items_center()
+        .when(!hovered, (c) => c.child(pinBtn("mods/workspace-chrome/pin.svg")))
+        .when(hovered, (c) => c
+          .child(pinBtn(`mods/workspace-chrome/${pinned ? "pin-off" : "pin"}.svg`))
+          .child(btn(`space-inactive-${w.id}`, inact ? "mods/my-spaces/archive-restore.svg" : "mods/workspace-chrome/archive.svg",
+            inact ? "Move back" : "Move to Inactive", () => this.setInactive(w.id, !inact))))))
+      .when(Boolean(fold), (el) => el.child(h_flex()
         .id(`space-fold-${w.id}`)
         .absolute().right(6).top((height - 20) / 2)
         .h(20).px(3).gap(3).items_center().flex_none().rounded(4)
@@ -482,7 +630,7 @@ export default class Spaces extends View {
         .tooltip(fold.open ? "Hide agents" : "Show agents")
         .on_click((_e, cx) => { fold.toggle(); cx.notify(); })
         .child(svg(`mods/workspace-chrome/chevron-${fold.open ? "down" : "right"}.svg`).size(11).flex_none())
-        .when(!fold.open, (el) => el.child(String(fold.n))));
+        .when(!fold.open, (c) => c.child(String(fold.n)))));
   }
 
   // ---- agents ----
@@ -669,9 +817,9 @@ export default class Spaces extends View {
   }
 
   // A space row and, unless folded, its agents under it.
-  withAgents(r, t, plan, now) {
+  withAgents(r, t, plan, now, flat = false) {
     const list = plan.by.get(r.w.id) ?? [];
-    if (!list.length) return [this.row(r, t)];
+    if (!list.length) return [this.row(r, t, null, flat)];
     const open = !this.agentsFolded.has(r.w.id);
     // Folded, the chevron says how many and colors the count by the most urgent one.
     const top = list.reduce((m, a) => ((RANK[a.status] ?? 0) > (RANK[m] ?? 0) ? a.status : m), null);
@@ -680,7 +828,7 @@ export default class Spaces extends View {
       localStorage.setItem("spaces.agents.folded", JSON.stringify([...this.agentsFolded]));
     };
     return [
-      this.row(r, t, { n: list.length, open, top, toggle }),
+      this.row(r, t, { n: list.length, open, top, toggle }, flat),
       ...(open ? list.flatMap((a) => this.agentBlock(a, t, r.tree ? 40 : 26, plan, now)) : []),
     ];
   }
@@ -741,7 +889,7 @@ export default class Spaces extends View {
           .on_click(() => run("space.new")).child(svg("mods/workspace-chrome/plus.svg").size(14))))
       .child(v_flex().flex_1().min_h(0).px(8).pb(14).overflow_y_scrollbar().mode("always")
         // A release anywhere else (on an agent row, say) ends a drag.
-        .on_mouse_up("left", (_e, cx) => { this.pressed = null; this.over = null; cx.notify(); })
+        .on_mouse_up("left", (_e, cx) => { this.endDrag(); cx.notify(); })
         .children(rows));
   }
 }
