@@ -19,7 +19,7 @@ $modSrc = Join-Path $PSScriptRoot 'mods\my-spaces'
 $modDst = Join-Path $home_ 'mods\my-spaces'
 New-Item -ItemType Directory -Force -Path $modDst | Out-Null
 # Only our files: the app writes gpui-kit.d.ts and jsconfig.json itself.
-foreach ($f in @('main.js', 'mod.json') + (Get-ChildItem $modSrc -Filter *.svg).Name) {
+foreach ($f in @('main.js', 'mod.json') + @(Get-ChildItem $modSrc -Filter *.svg | ForEach-Object Name)) {
   Copy-Item -Force (Join-Path $modSrc $f) (Join-Path $modDst $f)
 }
 Write-Host "mod    -> $modDst"
