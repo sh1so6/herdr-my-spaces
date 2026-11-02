@@ -74,3 +74,8 @@ The script overwrites `layouts/my-layout.json` in the config folder; sizes you d
 ```sh
 herdr-app check ~/.config/herdr-app/mods/my-spaces
 ```
+
+## License
+
+Apache-2.0 (see `LICENSE`). `mods/my-spaces` is derived from the `spaces` and `agents` mods shipped with
+the Herdr app (herdrdev/herdr-app, Apache-2.0).
