@@ -342,13 +342,16 @@ export default class Spaces extends View {
   // Spaces in order, each worktree space moved under its main checkout's: { out, inactive }.
   // The nesting is of the active spaces only; pinned ones lead (the rest keep the core's
   // order), a worktree stays under its checkout. `inactive`: the others, flat, core order.
-  ordered() {
+  // A space marked inactive that still has an agent (`plan.by`) is shown as an active one;
+  // it goes back to Inactive once its agents are gone.
+  ordered(plan) {
     const sp = spaces(), ps = panes();
     const ready = (w) => this.shown.has(w.id) || where(w, ps) in this.git || Date.now() - (this.born[w.id] ??= Date.now()) > 1500;
     for (const w of sp) if (!this.shown.has(w.id) && ready(w)) this.shown.add(w.id);
     const all = sp.map((w, i) => ({ w, i, g: this.git[where(w, ps)] ?? null })).filter((r) => this.shown.has(r.w.id));
-    const inactive = all.filter((r) => this.inactive.has(r.w.id)).map((r) => ({ ...r, tree: null }));
-    const list = all.filter((r) => !this.inactive.has(r.w.id));
+    const parked = (r) => this.inactive.has(r.w.id) && !plan.by.has(r.w.id);
+    const inactive = all.filter(parked).map((r) => ({ ...r, tree: null }));
+    const list = all.filter((r) => !parked(r));
     const mains = new Set(list.filter((r) => r.g && !r.g.linked).map((r) => r.g.repo));
     const nested = (r) => r.g?.linked && mains.has(r.g.repo);
     const out = [];
@@ -368,7 +371,7 @@ export default class Spaces extends View {
   // `plan`: this render's agents (see plan()); `order` gets every agent's address in the
   // order shown, folded or not, for agent.next and agent.prev.
   grouped(t, collapsed, plan, order, now) {
-    const { out: rows, inactive } = this.ordered();
+    const { out: rows, inactive } = this.ordered(plan);
     const claimed = new Set([...rows, ...inactive].map((r) => r.w.id));
     const draw = (r) => (collapsed ? [this.compact(r, t)] : this.withAgents(r, t, plan, now));
     const note = (r) => { for (const a of plan.by.get(r.w.id) ?? []) order.push(a.address); };
@@ -520,7 +523,8 @@ export default class Spaces extends View {
     const color = colors[w.id] ?? "ansi6";
     const fill = color.startsWith("#") ? color : (MARK[color] ?? t[color]);
     const height = rowHeight({ tree });
-    const inact = this.inactive.has(w.id);
+    const marked = this.inactive.has(w.id); // the user's choice
+    const inact = marked && !fold; // where it is shown: a space with agents stays among the active ones
     const pinned = this.pins.has(w.id);
     const hovered = this.hoverSpace === w.id && this.pressed === null;
     // An inactive space dragged over this active row comes back here.
@@ -617,8 +621,8 @@ export default class Spaces extends View {
         .when(!hovered, (c) => c.child(pinBtn("mods/workspace-chrome/pin.svg")))
         .when(hovered, (c) => c
           .child(pinBtn(`mods/workspace-chrome/${pinned ? "pin-off" : "pin"}.svg`))
-          .child(btn(`space-inactive-${w.id}`, inact ? "mods/my-spaces/archive-restore.svg" : "mods/workspace-chrome/archive.svg",
-            inact ? "Move back" : "Move to Inactive", () => this.setInactive(w.id, !inact))))))
+          .child(btn(`space-inactive-${w.id}`, marked ? "mods/my-spaces/archive-restore.svg" : "mods/workspace-chrome/archive.svg",
+            marked ? (inact ? "Move back" : "Keep active") : "Move to Inactive", () => this.setInactive(w.id, !marked))))))
       .when(Boolean(fold), (el) => el.child(h_flex()
         .id(`space-fold-${w.id}`)
         .absolute().right(6).top((height - 20) / 2)

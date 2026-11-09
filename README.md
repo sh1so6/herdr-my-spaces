@@ -25,7 +25,9 @@ hanging under it.
 - **Inactive group**: spaces you aren't using can be moved to an **Inactive (n)** group at the end of the list
   (after the machine groups and **Other**), folded by default. It lists every machine's inactive spaces flat, in
   core order, with the machine named, and their agents as usual. Its heading shows a dot when an inactive space has a
-  blocked or done agent; nothing is activated automatically. Move a space either with the second hover button
+  blocked or done agent. A space marked inactive that still has an agent (pi etc.) is shown among the normal spaces,
+  and drops back into Inactive when its agents are gone (its button then reads "Keep active"; press it to clear the mark).
+  Nothing else is activated automatically. Move a space either with the second hover button
   ("Move to Inactive" / "Move back") or by dragging its row onto the Inactive heading (or onto any row in it);
   drag an inactive row onto a machine heading or an active row to bring it back. The heading shows while dragging even
   when empty. Worktree nesting is computed from the active spaces only, so an active worktree of an inactive
